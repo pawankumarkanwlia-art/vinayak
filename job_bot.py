@@ -280,3 +280,16 @@ def main():
 
 if __name__ == "__main__":
     main()
+SOCIAL_LINKS = """
+📲 हमारे साथ जुड़ें:
+🟢 WhatsApp Group:
+https://chat.whatsapp.com/JrmKMtnVp8YJuc31I0C9u0
+
+🟢 WhatsApp Channel:
+https://whatsapp.com/channel/0029Vb6K1dpBlHphKeFhws0Z
+
+🔵 Telegram Channel:
+https://t.me/divyacybercafe
+"""
+
+message = message + "\n\n" + SOCIAL_LINKS
