@@ -1,295 +1,239 @@
 import os
 import re
 import json
-import time
 import html
 import logging
-from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse, urldefrag
-import xml.etree.ElementTree as ET
+from urllib.parse import urljoin, urlparse
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 SOURCES = [
     ("SarkariResult", "https://sarkariresult.com.cm/"),
     ("FreeJobAlert", "https://www.freejobalert.com/"),
 ]
-SEEN_FILE = "seen_jobs.json"
-MAX_NEW_PER_SOURCE = int(os.getenv("MAX_NEW_PER_SOURCE", "12"))
-REQUEST_TIMEOUT = 20
+SEEN_FILE = Path("seen_jobs.json")
+MAX_LINKS_PER_SOURCE = 35
+TIMEOUT = 25
+
+SOCIAL_LINKS = """
+📲 <b>हमारे साथ जुड़ें</b>
+🟢 <a href="https://chat.whatsapp.com/JrmKMtnVp8YJuc31I0C9u0">WhatsApp Group</a>
+🟢 <a href="https://whatsapp.com/channel/0029Vb6K1dpBlHphKeFhws0Z">WhatsApp Channel</a>
+🔵 <a href="https://t.me/divyacybercafe">Telegram Channel</a>
+"""
+
 HEADERS = {
-    "User-Agent": "SarkariJobAlertBot/1.0 (personal job alerts; contact: repository owner)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-JOB_HINTS = re.compile(
-    r"(recruit|vacanc|job|result|admit.?card|answer.?key|notification|"
-    r"application.?form|online.?form|sarkari|government|bharti|"
-    r"rojgar|exam|apprentice|officer|constable|teacher|clerk|"
-    r"railway|ssc|upsc|bank|police|court|army|navy|air.?force)",
-    re.I,
-)
-NON_JOB_HINTS = re.compile(
-    r"(privacy|disclaimer|contact.?us|about.?us|advertis|cookie|login|"
-    r"register|facebook|instagram|youtube|telegram|whatsapp|category/|tag/)",
-    re.I,
-)
-QUALIFICATION_HINTS = re.compile(
-    r"(qualification|educational qualification|eligibility|10th|12th|"
-    r"graduate|graduation|post.?graduate|diploma|degree|ITI|B\.?Tech|"
-    r"B\.?Ed|M\.?Sc|qualification details)",
-    re.I,
-)
-LAST_DATE_HINTS = re.compile(
-    r"(last date|closing date|apply before|online application last date|"
-    r"last date to apply|application deadline|महत्वपूर्ण तिथि|अंतिम तिथि)",
-    re.I,
-)
 
-def get_session():
-    s = requests.Session()
-    s.headers.update(HEADERS)
-    return s
-
-def clean_url(url):
-    url, _ = urldefrag(url)
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        return None
-    # Drop common tracking parameters while preserving useful query strings only when present.
-    if parsed.netloc.lower().startswith("www."):
-        netloc = parsed.netloc.lower()
-    else:
-        netloc = parsed.netloc.lower()
-    return parsed._replace(netloc=netloc, fragment="").geturl().rstrip("/")
-
-def same_domain(url, base_url):
-    a = urlparse(url).netloc.lower().removeprefix("www.")
-    b = urlparse(base_url).netloc.lower().removeprefix("www.")
-    return a == b
-
-def fetch(session, url):
+def get_page(url):
     try:
-        r = session.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        ctype = r.headers.get("Content-Type", "").lower()
-        if "text/html" not in ctype and "xml" not in ctype and not url.endswith(".xml"):
+        response = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "html" not in content_type and "text" not in content_type:
             return None
-        return r.text
+        response.encoding = response.apparent_encoding or response.encoding
+        return response.text
     except requests.RequestException as exc:
-        logging.warning("Fetch failed for %s: %s", url, exc)
+        logging.warning("Page fetch failed (%s): %s", url, exc)
         return None
 
-def parse_sitemap(session, base_url):
-    candidates = []
-    sitemap_urls = [urljoin(base_url, "sitemap.xml"), urljoin(base_url, "sitemap_index.xml")]
-    for sm_url in sitemap_urls:
-        raw = fetch(session, sm_url)
-        if not raw:
-            continue
-        try:
-            root = ET.fromstring(raw)
-            locs = [el.text.strip() for el in root.iter() if el.tag.lower().endswith("loc") and el.text]
-        except ET.ParseError:
-            continue
-        # Sitemap index: inspect a limited number of child sitemaps.
-        child_maps = [u for u in locs if u.lower().endswith(".xml")]
-        page_urls = [u for u in locs if not u.lower().endswith(".xml")]
-        for child in child_maps[:8]:
-            child_raw = fetch(session, child)
-            if not child_raw:
-                continue
-            try:
-                child_root = ET.fromstring(child_raw)
-                page_urls.extend(el.text.strip() for el in child_root.iter()
-                                 if el.tag.lower().endswith("loc") and el.text)
-            except ET.ParseError:
-                pass
-            time.sleep(0.4)
-        candidates.extend(page_urls)
-        if candidates:
-            break
-    return candidates
 
-def discover_links(session, source_name, base_url):
-    urls = []
-    homepage = fetch(session, base_url)
-    if homepage:
-        soup = BeautifulSoup(homepage, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = clean_url(urljoin(base_url, a["href"].strip()))
-            if not href or not same_domain(href, base_url):
-                continue
-            text = a.get_text(" ", strip=True)
-            combined = f"{text} {href}"
-            if NON_JOB_HINTS.search(combined):
-                continue
-            if JOB_HINTS.search(combined):
-                urls.append(href)
+def clean_text(value):
+    return re.sub(r"\s+", " ", value or "").strip(" \t\r\n:-|")
 
-    # Sitemaps can reveal newly published pages not prominent on the home page.
-    for url in parse_sitemap(session, base_url):
-        normalized = clean_url(url)
-        if normalized and same_domain(normalized, base_url) and not NON_JOB_HINTS.search(normalized):
-            if JOB_HINTS.search(normalized):
-                urls.append(normalized)
-
-    # Keep stable order and unique links.
-    seen = set()
-    out = []
-    for u in urls:
-        if u not in seen and u.rstrip("/") != base_url.rstrip("/"):
-            seen.add(u)
-            out.append(u)
-    logging.info("%s: discovered %d candidate URLs", source_name, len(out))
-    return out
-
-def extract_detail(session, source_name, url):
-    raw = fetch(session, url)
-    if not raw:
-        return None
-    soup = BeautifulSoup(raw, "html.parser")
-    for node in soup(["script", "style", "nav", "footer", "header", "noscript", "form"]):
-        node.decompose()
-
-    title = ""
-    for selector in ("h1", "article h2", "main h2", "title"):
-        node = soup.select_one(selector)
-        if node:
-            title = node.get_text(" ", strip=True)
-            if title:
-                break
-    title = re.sub(r"\s+", " ", html.unescape(title)).strip()
-    if not title:
-        return None
-
-    body = soup.get_text("\n", strip=True)
-    body = re.sub(r"[ \t]+", " ", body)
-    lines = [re.sub(r"\s+", " ", x).strip() for x in body.splitlines()]
-    lines = [x for x in lines if x]
-    # Avoid sending pages that are probably category pages or unrelated.
-    if not JOB_HINTS.search(title + " " + url):
-        return None
-
-    qualification = "उपलब्ध नहीं — कृपया आधिकारिक नोटिफिकेशन देखें"
-    last_date = "उपलब्ध नहीं — कृपया आधिकारिक नोटिफिकेशन देखें"
-
-    for i, line in enumerate(lines):
-        if QUALIFICATION_HINTS.search(line):
-            qualification = line[:450]
-            if len(qualification) < 100 and i + 1 < len(lines):
-                qualification += " " + lines[i + 1][:250]
-            break
-
-    for i, line in enumerate(lines):
-        if LAST_DATE_HINTS.search(line):
-            last_date = line[:450]
-            if len(last_date) < 100 and i + 1 < len(lines):
-                last_date += " " + lines[i + 1][:250]
-            break
-
-    # If the page has no explicit application deadline, do not guess.
-    return {
-        "source": source_name,
-        "title": title[:240],
-        "url": url,
-        "qualification": qualification,
-        "last_date": last_date,
-        "found_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
 
 def load_seen():
     try:
-        with open(SEEN_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        return set(json.loads(SEEN_FILE.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        return set()
+
 
 def save_seen(seen):
-    with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(seen, f, ensure_ascii=False, indent=2, sort_keys=True)
+    SEEN_FILE.write_text(json.dumps(sorted(seen), ensure_ascii=False, indent=2), encoding="utf-8")
 
-def send_telegram(session, token, chat_id, job):
-    text = (
-        "🆕 <b>नई सरकारी नौकरी / भर्ती अपडेट</b>\n\n"
-        f"<b>पोस्ट:</b> {html.escape(job['title'])}\n"
-        f"<b>स्रोत:</b> {html.escape(job['source'])}\n"
-        f"<b>योग्यता:</b> {html.escape(job['qualification'])}\n"
-        f"<b>अंतिम तिथि:</b> {html.escape(job['last_date'])}\n\n"
-        f"🔗 <a href=\"{html.escape(job['url'], quote=True)}\">पूरी जानकारी / आधिकारिक पेज</a>\n"
-        f"<i>जाने से पहले आधिकारिक नोटिफिकेशन में विवरण सत्यापित करें।</i>"
+
+def is_job_link(title, url):
+    title_l = title.lower()
+    url_l = url.lower()
+    skip = ("privacy", "contact us", "about us", "disclaimer", "sitemap", "login", "home")
+    if len(title) < 12 or any(x in title_l for x in skip):
+        return False
+    job_words = ("recruitment", "recruitment 202", "vacancy", "vacancies", "admit card",
+                 "result", "answer key", "notification", "apply online", "jobs", "job",
+                 "bharti", "sarkari", "exam", "application", "post")
+    return any(word in title_l or word in url_l for word in job_words)
+
+
+def collect_job_links(source_url, source_name):
+    page = get_page(source_url)
+    if not page:
+        return []
+    soup = BeautifulSoup(page, "html.parser")
+    found, seen_urls = [], set()
+    domain = urlparse(source_url).netloc.lower()
+    for a in soup.select("a[href]"):
+        title = clean_text(a.get_text(" ", strip=True))
+        href = urljoin(source_url, a.get("href", "").strip())
+        parsed = urlparse(href)
+        if parsed.scheme not in ("http", "https") or not title:
+            continue
+        if parsed.netloc.lower() != domain:
+            continue
+        if href.rstrip("/") == source_url.rstrip("/") or href in seen_urls:
+            continue
+        if not is_job_link(title, href):
+            continue
+        seen_urls.add(href)
+        found.append({"title": title, "url": href, "source": source_name})
+        if len(found) >= MAX_LINKS_PER_SOURCE:
+            break
+    logging.info("%s: found %d possible links", source_name, len(found))
+    return found
+
+
+def extract_labeled_value(text, labels):
+    for label in labels:
+        # Match label followed by optional punctuation and value up to a likely next label/newline.
+        pattern = rf"(?:{label})\s*[:：\-]?\s*(.{{1,180}}?)(?=\s+(?:Department|Qualification|Educational Qualification|Age Limit|Last Date|Important Dates|Application Fee|Selection Process|How to Apply|Official Notification|Apply Online|Total Vacancy|Vacancies|Starting Date)\s*[:：\-]|$)"
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            value = clean_text(match.group(1))
+            if value and value.lower() not in ("click here", "here", "check notification"):
+                return value[:180]
+    return ""
+
+
+def extract_detail(job):
+    page = get_page(job["url"])
+    if not page:
+        return job
+    soup = BeautifulSoup(page, "html.parser")
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+    text = clean_text(soup.get_text(" ", strip=True))
+    title_tag = soup.find(["h1", "h2"])
+    if title_tag:
+        page_title = clean_text(title_tag.get_text(" ", strip=True))
+        if len(page_title) >= 8:
+            job["title"] = page_title[:220]
+
+    # Extract links by their visible labels; keep only URLs on the page.
+    apply_url = ""
+    pdf_url = ""
+    for a in soup.select("a[href]"):
+        label = clean_text(a.get_text(" ", strip=True)).lower()
+        href = urljoin(job["url"], a.get("href", "").strip())
+        if not href.startswith(("http://", "https://")):
+            continue
+        if not apply_url and any(x in label for x in ("apply online", "online apply", "apply here", "registration")):
+            apply_url = href
+        if not pdf_url and (".pdf" in urlparse(href).path.lower() or "notification" in label or "advertisement" in label):
+            pdf_url = href
+
+    fields = {
+        "department": [r"Department Name", r"Department", r"Organization"],
+        "vacancies": [r"Total Vacancies", r"Total Vacancy", r"No\.? of Posts", r"Vacancy Details", r"Total Posts"],
+        "qualification": [r"Educational Qualification", r"Qualification", r"Education"],
+        "age_limit": [r"Age Limit", r"Age Criteria"],
+        "start_date": [r"Starting Date", r"Application Start Date", r"Online Apply Start Date"],
+        "last_date": [r"Last Date", r"Last Date to Apply", r"Closing Date", r"Apply Last Date"],
+        "fee": [r"Application Fee", r"Exam Fee", r"Fee Details"],
+        "selection": [r"Selection Process", r"Mode of Selection"],
+    }
+    for key, labels in fields.items():
+        job[key] = extract_labeled_value(text, labels)
+
+    job["apply_url"] = apply_url
+    job["pdf_url"] = pdf_url
+    return job
+
+
+def safe(value, limit=220):
+    value = clean_text(str(value or ""))
+    return html.escape(value[:limit]) if value else "उपलब्ध नहीं — आधिकारिक नोटिफिकेशन देखें"
+
+
+def link_line(label, url):
+    if url and url.startswith(("https://", "http://")):
+        return f'🔗 <b>{label}:</b> <a href="{html.escape(url, quote=True)}">यहाँ क्लिक करें</a>'
+    return f"🔗 <b>{label}:</b> उपलब्ध नहीं — आधिकारिक वेबसाइट देखें"
+
+
+def make_message(job):
+    return (
+        f"📢 <b>{safe(job.get('title'))}</b>\n\n"
+        f"🏢 <b>विभाग:</b> {safe(job.get('department'))}\n"
+        f"👥 <b>कुल पद:</b> {safe(job.get('vacancies'))}\n"
+        f"🎓 <b>योग्यता:</b> {safe(job.get('qualification'))}\n"
+        f"🎂 <b>आयु सीमा:</b> {safe(job.get('age_limit'))}\n"
+        f"📅 <b>आवेदन शुरू:</b> {safe(job.get('start_date'))}\n"
+        f"⏰ <b>अंतिम तिथि:</b> {safe(job.get('last_date'))}\n"
+        f"💳 <b>आवेदन शुल्क:</b> {safe(job.get('fee'))}\n"
+        f"📝 <b>चयन प्रक्रिया:</b> {safe(job.get('selection'))}\n\n"
+        f"{link_line('ऑनलाइन आवेदन', job.get('apply_url'))}\n"
+        f"{link_line('आधिकारिक नोटिफिकेशन / PDF', job.get('pdf_url'))}\n"
+        f"🌐 <b>जानकारी का स्रोत:</b> <a href=\"{html.escape(job['url'], quote=True)}\">{html.escape(job.get('source', 'वेबसाइट'))}</a>\n\n"
+        + SOCIAL_LINKS
     )
-    api_url = f"https://api.telegram.org/bot{token}/sendMessage"
-    response = session.post(api_url, json={
-        "chat_id": chat_id,
-        "text": text[:4000],
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }, timeout=REQUEST_TIMEOUT)
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = {}
-    if response.status_code != 200 or not payload.get("ok"):
-        raise RuntimeError(f"Telegram send failed: HTTP {response.status_code}; {payload.get('description', response.text[:300])}")
 
-def main():
+
+def send_telegram(message):
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
-        raise SystemExit("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment secret.")
+        raise RuntimeError("GitHub Secrets में TELEGRAM_BOT_TOKEN और TELEGRAM_CHAT_ID सेट करें।")
+    api_url = f"https://api.telegram.org/bot{token}/sendMessage"
+    response = requests.post(
+        api_url,
+        data={
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=TIMEOUT,
+    )
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    if response.status_code != 200 or not data.get("ok"):
+        raise RuntimeError(f"Telegram API error: HTTP {response.status_code} - {data}")
+    logging.info("Telegram message sent.")
 
-    session = get_session()
+
+def main():
     seen = load_seen()
-    newly_found = []
+    new_seen = set(seen)
+    candidates = []
+    for source_name, source_url in SOURCES:
+        candidates.extend(collect_job_links(source_url, source_name))
 
-    for source_name, base_url in SOURCES:
-        urls = discover_links(session, source_name, base_url)
-        # New URLs only; details are fetched only for not-yet-seen candidates.
-        fresh_urls = [u for u in urls if u not in seen][:MAX_NEW_PER_SOURCE]
-        for url in fresh_urls:
-            job = extract_detail(session, source_name, url)
-            # Mark every checked candidate as seen to avoid repeated bad pages.
-            seen[url] = {
-                "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "title": job["title"] if job else "",
-            }
-            if job:
-                newly_found.append(job)
-            time.sleep(0.8)
-
-    # Save state even if no valid new jobs were found. Workflow commits this file.
-    save_seen(seen)
-
-    sent = 0
-    for job in newly_found:
+    sent_count = 0
+    for item in candidates:
+        url = item["url"]
+        if url in seen:
+            continue
+        details = extract_detail(item)
+        message = make_message(details)
         try:
-            send_telegram(session, token, chat_id, job)
-            sent += 1
-            logging.info("Sent: %s", job["title"])
-            time.sleep(1.2)
+            send_telegram(message)
+            new_seen.add(url)
+            sent_count += 1
         except Exception as exc:
-            # If a send fails, remove it from seen so the next run can retry.
-            seen.pop(job["url"], None)
-            logging.error("Could not send %s: %s", job["url"], exc)
-    save_seen(seen)
-    logging.info("Finished. New valid jobs: %d; Telegram messages sent: %d", len(newly_found), sent)
+            logging.error("Could not send %s: %s", url, exc)
+            # Do not mark as seen, so it can retry next run.
+    save_seen(new_seen)
+    logging.info("Finished. New alerts sent: %d", sent_count)
+
 
 if __name__ == "__main__":
     main()
-SOCIAL_LINKS = """
-📲 हमारे साथ जुड़ें:
-🟢 WhatsApp Group:
-https://chat.whatsapp.com/JrmKMtnVp8YJuc31I0C9u0
-
-🟢 WhatsApp Channel:
-https://whatsapp.com/channel/0029Vb6K1dpBlHphKeFhws0Z
-
-🔵 Telegram Channel:
-https://t.me/divyacybercafe
-"""
-
-message = message + "\n\n" + SOCIAL_LINKS
